@@ -1,0 +1,253 @@
+# bump: pillow-version /PILLOW_VERSION="(.*)"/ https://github.com/python-pillow/Pillow.git|semver:*
+PILLOW_VERSION="12.3.0"
+
+###
+### Build control file for the pillow port
+###
+### Pillow is the imaging library nearly everything reaches for. It unblocks
+### fpdf2, python-pptx and rst2pdf, each of which was waiting on it alone.
+###
+### It needs two C libraries, both now available: zlib, which was already
+### ported, and libjpeg-turbo, ported for this.
+###
+
+export ZOPEN_PROJECT_NAME="pillow"
+export ZOPEN_BUILD_LINE="STABLE"
+export ZOPEN_CATEGORIES="development library graphics"
+
+export ZOPEN_STABLE_URL="https://github.com/python-pillow/Pillow.git"
+export ZOPEN_STABLE_TAG="${PILLOW_VERSION}"
+export ZOPEN_DEV_URL="https://github.com/python-pillow/Pillow.git"
+
+export ZOPEN_STABLE_DEPS="check_python zlib libjpeg-turbo zoslib"
+export ZOPEN_DEV_DEPS="check_python zlib libjpeg-turbo zoslib"
+export ZOPEN_RUNTIME_DEPS="check_python zlib libjpeg-turbo"
+
+export ZOPEN_BUILD_SYSTEM="Python"
+
+zopen_get_version() {
+  echo "${PILLOW_VERSION}"
+}
+
+zopen_pre_build() {
+  _zlib="${ZLIB_HOME:-}"
+  _jpeg="${LIBJPEG_TURBO_HOME:-}"
+  _zoslib="${ZOSLIB_HOME:-}"
+
+  [ -n "${_zlib}" ] && [ -f "${_zlib}/include/zlib.h" ] \
+    || printError "zlib not found; ZOPEN_STABLE_DEPS should have installed it"
+  [ -n "${_jpeg}" ] && [ -f "${_jpeg}/include/jpeglib.h" ] \
+    || printError "libjpeg-turbo not found; ZOPEN_STABLE_DEPS should have installed it"
+  [ -n "${_zoslib}" ] && [ -f "${_zoslib}/lib/celquopt.s.o" ] \
+    || printError "zoslib not found; ZOPEN_STABLE_DEPS should have installed it"
+
+  # _OPEN_THREADS is not optional. Python's own cpython/pythread.h uses
+  # pthread_t, which is undeclared without it, so the very first extension fails
+  # with "unknown type name 'pthread_t'" pointing inside the interpreter's
+  # headers -- which reads as a broken Python installation rather than a missing
+  # feature-test macro. _UNIX03_SOURCE comes along for posix_memalign, on the
+  # same footing as the other C ports here.
+  #
+  # Set on CFLAGS rather than ZOPEN_EXTRA_CFLAGS: the latter is composed into
+  # the flags for the configure and make path and never reaches a
+  # setuptools-driven build.
+  export CFLAGS="-D_OPEN_THREADS=3 -D_UNIX03_SOURCE -I${_zlib}/include -I${_jpeg}/include ${CFLAGS}"
+
+  # Pillow's extensions are compiled against zoslib like everything else here,
+  # so they need it at link time or the binder ends with RC 12 on __open_ascii
+  # and __close -- which reads as a corrupt library rather than a short link
+  # line. celquopt.s.o is a plain object and therefore positional.
+  export LDFLAGS="-L${_zlib}/lib -L${_jpeg}/lib -L${_zoslib}/lib -lzoslib ${_zoslib}/lib/celquopt.s.o -lzoslib-supp ${LDFLAGS}"
+
+  printInfo "Building against zlib in ${_zlib} and libjpeg in ${_jpeg}"
+  return 0
+}
+
+zopen_python_test() {
+  PILLOW_EXPECTED_VERSION="${PILLOW_VERSION}" python - <<'PYEOF'
+import io
+import os
+import sys
+import sysconfig
+
+# Exercise the installed wheel rather than the checkout, which would otherwise
+# shadow it and let the tests pass against source that was never packaged.
+#
+# realpath on both sides: /tmp is a symlink to /$SYSNAME/tmp here, so a path
+# spelled /tmp/... and a working directory of /S0W1/tmp/... are the same place
+# while abspath compares them as different.
+_here = os.path.realpath(os.getcwd())
+sys.path = [p for p in sys.path
+            if p not in ("", ".") and os.path.realpath(p) != _here]
+
+failures = 0
+total = 0
+
+
+def check(label, fn):
+    global failures, total
+    total += 1
+    try:
+        if fn():
+            print("PASS:", label)
+        else:
+            print("FAIL:", label, file=sys.stderr)
+            failures += 1
+    except Exception as exc:
+        print("FAIL:", label, "-", exc, file=sys.stderr)
+        failures += 1
+
+
+try:
+    from PIL import Image, ImageDraw, ImageFilter, features
+except ImportError as exc:
+    print("FAIL: import PIL -", exc, file=sys.stderr)
+    print("pillow FAILED to import on Python %s" % sys.version.split()[0])
+    sys.exit(1)
+
+import importlib.metadata
+
+check("imported from the installed wheel, not the source tree",
+      lambda: os.path.realpath(Image.__file__).startswith(
+          os.path.realpath(sysconfig.get_paths()["purelib"])))
+
+check("version is the one this port builds",
+      lambda: importlib.metadata.version("pillow")
+      == os.environ["PILLOW_EXPECTED_VERSION"])
+
+# The two codecs this port exists to provide. Pillow imports and runs plenty
+# without them, so state plainly that they are compiled in -- otherwise a build
+# that silently lost libjpeg would look healthy.
+check("the zlib codec is compiled in", lambda: features.check("zlib"))
+check("the jpeg codec is compiled in", lambda: features.check("jpg"))
+
+# A gradient exercises the DCT far harder than a flat colour would.
+_w, _h = 128, 96
+_src = Image.new("RGB", (_w, _h))
+_src.putdata([((x * 2) % 256, (y * 2) % 256, (x + y) % 256)
+              for y in range(_h) for x in range(_w)])
+
+
+def png_is_lossless():
+    # PNG is lossless, so any difference at all is a real defect rather than
+    # compression. This is the sharpest correctness check available.
+    buf = io.BytesIO()
+    _src.save(buf, "PNG")
+    back = Image.open(io.BytesIO(buf.getvalue()))
+    back.load()
+    return list(back.getdata()) == list(_src.getdata())
+
+
+check("PNG round trips losslessly", png_is_lossless)
+
+
+def jpeg_within_tolerance():
+    # Lossy, so measure the error rather than demanding equality. A codec broken
+    # by byte order or a bad DCT would be wrong by far more than a few levels.
+    buf = io.BytesIO()
+    _src.save(buf, "JPEG", quality=95)
+    back = Image.open(io.BytesIO(buf.getvalue()))
+    back.load()
+    worst = max(max(abs(a - b) for a, b in zip(p, q))
+                for p, q in zip(_src.getdata(), back.getdata()))
+    print("     jpeg q95 max channel error: %d" % worst)
+    return worst <= 8
+
+
+check("JPEG round trips within tolerance", jpeg_within_tolerance)
+
+
+def grayscale_jpeg():
+    grey = _src.convert("L")
+    buf = io.BytesIO()
+    grey.save(buf, "JPEG", quality=95)
+    back = Image.open(io.BytesIO(buf.getvalue()))
+    back.load()
+    return max(abs(a - b) for a, b in zip(grey.getdata(), back.getdata())) <= 8
+
+
+check("grayscale JPEG round trips", grayscale_jpeg)
+
+
+def progressive_jpeg():
+    buf = io.BytesIO()
+    _src.save(buf, "JPEG", quality=90, progressive=True)
+    back = Image.open(io.BytesIO(buf.getvalue()))
+    back.load()
+    return back.size == _src.size
+
+
+check("progressive JPEG encodes and decodes", progressive_jpeg)
+
+check("images resize", lambda: _src.resize((64, 48)).size == (64, 48))
+check("images rotate", lambda: _src.rotate(90, expand=True).size == (_h, _w))
+check("images crop", lambda: _src.crop((0, 0, 32, 32)).size == (32, 32))
+
+check("mode conversion to RGBA and back",
+      lambda: _src.convert("RGBA").convert("RGB").getdata()[0] == _src.getdata()[0])
+
+
+def drawing_works():
+    im = Image.new("RGB", (32, 32), (0, 0, 0))
+    d = ImageDraw.Draw(im)
+    d.rectangle((8, 8, 24, 24), fill=(255, 0, 0))
+    return im.getpixel((16, 16)) == (255, 0, 0) and im.getpixel((0, 0)) == (0, 0, 0)
+
+
+check("drawing primitives work", drawing_works)
+
+check("filters run", lambda: _src.filter(ImageFilter.BLUR).size == _src.size)
+
+
+def bmp_and_gif():
+    # Formats Pillow implements itself, so they exercise its own code paths
+    # rather than a linked library.
+    out = {}
+    for fmt in ("BMP", "GIF", "PPM"):
+        buf = io.BytesIO()
+        (_src if fmt != "GIF" else _src.convert("P")).save(buf, fmt)
+        back = Image.open(io.BytesIO(buf.getvalue()))
+        back.load()
+        out[fmt] = back.size == _src.size
+    return all(out.values())
+
+
+check("BMP, GIF and PPM round trip", bmp_and_gif)
+
+print()
+print("pillow %s on Python %s  --  %d passed, %d failed" % (
+    importlib.metadata.version("pillow"),
+    sys.version.split()[0], total - failures, failures))
+sys.exit(1 if failures else 0)
+PYEOF
+}
+
+zopen_check_results() {
+  dir="$1"; pfx="$2"; chk="${dir}/${pfx}_check.log"
+  # No "|| echo 0": grep -c prints 0 when nothing matches and also exits 1, so
+  # the fallback appends a second zero and the arithmetic dies with FSUM9224.
+  passed=$(grep -c "^PASS:" "${chk}" 2>/dev/null)
+  failed=$(grep -c "^FAIL:" "${chk}" 2>/dev/null)
+  passed=${passed:-0}
+  failed=${failed:-0}
+  total=$((passed + failed))
+
+  # An interpreter whose test script dies before the first check contributes no
+  # PASS and no FAIL, so counting those alone would score a crash as a clean run.
+  interpreters=$(grep -c "^pillow .* on Python" "${chk}" 2>/dev/null)
+  interpreters=${interpreters:-0}
+  expected=$(echo "${ZOPEN_PYTHON_VERSIONS:-3.12 3.13 3.14}" | wc -w | tr -d ' ')
+  if [ "${interpreters}" -lt "${expected}" ]; then
+    silent=$((expected - interpreters))
+    failed=$((failed + silent))
+    total=$((total + silent))
+  fi
+
+  echo "actualFailures:${failed}"
+  echo "totalTests:${total}"
+  echo "expectedFailures:0"
+}
+
+zopen_append_to_validate_install() {
+  echo "python3 -c \"from PIL import Image, features; assert features.check('jpg') and features.check('zlib'); import importlib.metadata; print('pillow', importlib.metadata.version('pillow'), 'jpeg+zlib')\""
+}
