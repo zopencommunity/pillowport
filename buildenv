@@ -1,5 +1,5 @@
 # bump: pillow-version /PILLOW_VERSION="(.*)"/ https://github.com/python-pillow/Pillow.git|semver:*
-PILLOW_VERSION="12.3.0"
+PILLOW_VERSION="13.0.0"
 
 ###
 ### Build control file for the pillow port
